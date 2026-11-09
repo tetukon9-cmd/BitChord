@@ -23,9 +23,10 @@
 	}
 	handle {
 		reverse_proxy 127.0.0.1:8000 {
-			# The Go server rate-limits by the first X-Forwarded-For entry
-			# (JAM_TRUST_PROXY). Send exactly the resolved client, never a
-			# chain that starts with whatever the caller wrote.
+			# The Go server rate-limits by the last X-Forwarded-For entry
+			# (JAM_TRUST_PROXY), the one the proxy in front of it appended.
+			# Send exactly the resolved client, never a chain that starts
+			# with whatever the caller wrote.
 			header_up X-Forwarded-For {client_ip}
 		}
 	}

@@ -550,3 +550,71 @@ func TestWebSocketTokenAsSubprotocol(t *testing.T) {
 		t.Fatalf("expected 401 for a wrong subprotocol token, got %v", err)
 	}
 }
+
+// Rate limiting must key on the address our own proxy appended (the last
+// X-Forwarded-For entry), not on anything the caller put in front of it.
+func TestClientIPIgnoresSpoofedForwardedFor(t *testing.T) {
+	old := config.TrustProxy
+	config.TrustProxy = true
+	defer func() { config.TrustProxy = old }()
+
+	cases := []struct{ header, want string }{
+		{"198.51.100.7", "198.51.100.7"},
+		{"1.2.3.4, 198.51.100.7", "198.51.100.7"},
+		{"1.2.3.4,5.6.7.8 ,  198.51.100.7 ", "198.51.100.7"},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:5555"
+		r.Header.Set("X-Forwarded-For", c.header)
+		if got := clientIP(r); got != c.want {
+			t.Errorf("X-Forwarded-For %q: got %q, want %q", c.header, got, c.want)
+		}
+	}
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:5555"
+	if got := clientIP(r); got != "10.0.0.1" {
+		t.Errorf("no header: got %q, want the socket address", got)
+	}
+
+	config.TrustProxy = false
+	r.Header.Set("X-Forwarded-For", "1.2.3.4")
+	if got := clientIP(r); got != "10.0.0.1" {
+		t.Errorf("untrusted proxy: got %q, want the socket address", got)
+	}
+}
+
+// A malformed code is shown once-escaped (not "&amp;lt;") and capped in length,
+// and the page carries its anti-embedding headers.
+func TestInviteLandingBadCodeAndHeaders(t *testing.T) {
+	ts := setupTestServer()
+	defer ts.Close()
+
+	res, err := http.Get(ts.URL + "/invite/" + strings.Repeat("a", 200) + "%3Cb%3E")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", res.StatusCode)
+	}
+	for h, want := range map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "no-referrer",
+	} {
+		if got := res.Header.Get(h); got != want {
+			t.Errorf("%s = %q, want %q", h, got, want)
+		}
+	}
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(res.Body)
+	body := buf.String()
+	if strings.Contains(body, "<b>") || strings.Contains(body, "&amp;lt;") {
+		t.Errorf("code reflected unsafely or double-escaped")
+	}
+	if strings.Contains(body, strings.Repeat("a", 33)) {
+		t.Errorf("code was not truncated")
+	}
+}

@@ -336,7 +336,7 @@ Every one of these is optional — `config/config.go` carries the same defaults.
 | `JAM_WEBSOCKET_MAX_BYTES` | `16384` | Maximum incoming WebSocket message size. |
 | `JAM_CONNECTION_IDLE_MS` | `900000` | Close a WebSocket that sends no message for 15 minutes. |
 | `JAM_ALLOWED_ORIGINS` | *(none)* | Comma-separated browser Origin allowlist. Native clients send no Origin and remain supported. |
-| `JAM_TRUST_PROXY` | `false` | Read `X-Forwarded-For` for rate limiting only when a trusted proxy terminates requests. |
+| `JAM_TRUST_PROXY` | `false` | Read `X-Forwarded-For` for rate limiting only when a trusted proxy terminates requests. The **last** entry is used (the one your proxy appended); entries before it are client-supplied and ignored. Exactly one trusted proxy hop is assumed. |
 | `JAM_PUBLIC_ORIGIN` | *(none)* | Public origin emitted verbatim in invite deep links, e.g. `https://party.example.com`. Set it when TLS terminates upstream and `X-Forwarded-Proto` may be rewritten or dropped along the way. |
 | `PORT` | `8000` | Port the server listens on. |
 

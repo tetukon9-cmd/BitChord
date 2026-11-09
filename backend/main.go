@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"html/template"
 	"io"
 	"log"
@@ -28,15 +27,15 @@ import (
 )
 
 var (
-	store    = party.NewPartyStore()
-	hubInst  = hub.NewHub()
-	createLimiter = newIPRateLimiter(time.Minute, config.CreateRatePerMinute, config.RateLimitMaxEntries)
+	store           = party.NewPartyStore()
+	hubInst         = hub.NewHub()
+	createLimiter   = newIPRateLimiter(time.Minute, config.CreateRatePerMinute, config.RateLimitMaxEntries)
 	presenceTracker = presence.NewTracker(
 		time.Duration(config.PresenceIntervalSec+config.PresenceGraceSec)*time.Second,
 		config.PresenceMaxEntries,
 	)
 	presenceLimiter = newIPRateLimiter(time.Minute, config.PresencePingsPerMinute, config.PresenceRateLimitMaxIPs)
-	upgrader = websocket.Upgrader{
+	upgrader        = websocket.Upgrader{
 		// Answered only to a browser that offered it with its token (see
 		// parseSocketToken); a native client offers no subprotocol and gets none.
 		Subprotocols: []string{socketProtocol},
@@ -165,7 +164,13 @@ func (l *ipRateLimiter) Allow(ip string) bool {
 
 func clientIP(r *http.Request) string {
 	if config.TrustProxy {
-		if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); forwarded != "" {
+		// The last entry is the one our own proxy appended. Everything to its
+		// left is whatever the caller wrote, so reading the first entry lets any
+		// client dodge the rate limits by sending a made-up X-Forwarded-For.
+		// With the Caddy deploy (one resolved client, see deploy/Caddyfile) the
+		// two are the same entry.
+		parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		if forwarded := strings.TrimSpace(parts[len(parts)-1]); forwarded != "" {
 			return forwarded
 		}
 	}
@@ -250,10 +255,10 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"service":    "bitchord-listen-together",
-		"members":    store.MemberCount(),
-		"parties":    store.Len(),
-		"serverMs":   clock.NowMs(),
+		"service":  "bitchord-listen-together",
+		"members":  store.MemberCount(),
+		"parties":  store.Len(),
+		"serverMs": clock.NowMs(),
 	})
 }
 
@@ -358,7 +363,9 @@ func handleCreateParty(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxMembers := 5
-	if req.MaxMembers != nil { maxMembers = *req.MaxMembers }
+	if req.MaxMembers != nil {
+		maxMembers = *req.MaxMembers
+	}
 	p, err := store.CreateWithLimits(config.MaxParties, maxMembers)
 	if err != nil {
 		if pe, ok := err.(*party.PartyError); ok {
@@ -368,13 +375,14 @@ func handleCreateParty(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "server_error", "Failed to create party.")
 		return
 	}
+	p.Lock()
 	// This must be present in the creation response. Waiting for the first
 	// WebSocket control can lose the setting before that socket is established.
+	// Set under the lock: the party is already in the store, so a socket that
+	// guessed its code could be reading Playback at the same moment.
 	if req.AutoplayEnabled != nil {
 		p.Playback.AutoplayEnabled = *req.AutoplayEnabled
 	}
-
-	p.Lock()
 	m, err := p.Join(req.UserId, req.DeviceId, req.DisplayName, req.AvatarUrl)
 	if err != nil {
 		p.Unlock()
@@ -784,6 +792,13 @@ var inviteTemplate = template.Must(template.New("invite").Parse(`<!DOCTYPE html>
 </body>
 </html>`))
 
+func truncateRunes(s string, max int) string {
+	if r := []rune(s); len(r) > max {
+		return string(r[:max])
+	}
+	return s
+}
+
 func requestOrigin(r *http.Request) string {
 	if config.PublicOrigin != "" {
 		return config.PublicOrigin
@@ -808,11 +823,19 @@ func handleInviteLanding(w http.ResponseWriter, r *http.Request) {
 	code := codes.Normalise(r.PathValue("code"))
 	origin := requestOrigin(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// The page is a launcher, never something to embed or sniff. A strict CSP is
+	// not possible while the launcher script and styles are inline.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 
 	if len(code) != codes.CodeLength {
 		w.WriteHeader(http.StatusBadRequest)
+		// html/template escapes on output; escaping here as well showed
+		// "&amp;" to the visitor. The length cap keeps a long path segment from
+		// being reflected back in full.
 		_ = inviteTemplate.Execute(w, invitePageData{
-			Code:     html.EscapeString(r.PathValue("code")),
+			Code:     truncateRunes(r.PathValue("code"), 32),
 			IsActive: false,
 		})
 		return
@@ -1155,7 +1178,9 @@ func applyControl(p *party.Party, member *party.Member, action string, frame map
 
 	case protocol.ActionSetMaxMembers:
 		value, ok := frame["maxMembers"].(float64)
-		if !ok { return false, "invalid_capacity", "Choose a party size between 2 and 10." }
+		if !ok {
+			return false, "invalid_capacity", "Choose a party size between 2 and 10."
+		}
 		if err := p.SetMaxMembers(member, int(value)); err != nil {
 			pe := err.(*party.PartyError)
 			return false, pe.Code, pe.Message
@@ -1183,9 +1208,15 @@ func applyControl(p *party.Party, member *party.Member, action string, frame map
 
 	case protocol.ActionKick:
 		targetID, _ := frame["memberId"].(string)
-		if !member.IsHost { return false, "host_only", "Only the host can remove listeners." }
-		if targetID == "" || targetID == member.MemberId { return false, "invalid_member", "Choose another listener to remove." }
-		if p.Remove(targetID) == nil { return false, "not_found", "That listener is no longer in this party." }
+		if !member.IsHost {
+			return false, "host_only", "Only the host can remove listeners."
+		}
+		if targetID == "" || targetID == member.MemberId {
+			return false, "invalid_member", "Choose another listener to remove."
+		}
+		if p.Remove(targetID) == nil {
+			return false, "not_found", "That listener is no longer in this party."
+		}
 		hubInst.Send(p.Code, targetID, map[string]interface{}{
 			"type":    protocol.FrameBye,
 			"reason":  "kicked",
@@ -1218,27 +1249,46 @@ func activityFrame(member *party.Member, action string, frame map[string]interfa
 	}
 	switch action {
 	case protocol.ActionSetTrack:
-		if title := trackTitle(frame["track"]); title != "" { detail = "Changed the song to \"" + title + "\"" }
+		if title := trackTitle(frame["track"]); title != "" {
+			detail = "Changed the song to \"" + title + "\""
+		}
 	case protocol.ActionQueueAdd:
 		if tracks, ok := frame["tracks"].([]interface{}); ok && len(tracks) > 0 {
 			title := trackTitle(tracks[0])
 			if title != "" {
-				if len(tracks) == 1 { detail = "Added \"" + title + "\" to the queue" } else { detail = fmt.Sprintf("Added \"%s\" and %d more to the queue", title, len(tracks)-1) }
+				if len(tracks) == 1 {
+					detail = "Added \"" + title + "\" to the queue"
+				} else {
+					detail = fmt.Sprintf("Added \"%s\" and %d more to the queue", title, len(tracks)-1)
+				}
 			}
 		}
 	case protocol.ActionSetQueue:
-		if tracks, ok := frame["queue"].([]interface{}); ok { detail = fmt.Sprintf("Replaced the queue with %d tracks", len(tracks)) }
-	case protocol.ActionQueueRemove: detail = "Removed a track from the queue"
-	case protocol.ActionQueueClear: detail = "Cleared upcoming tracks"
-	case protocol.ActionQueueMove: detail = "Reordered the upcoming queue"
-	case protocol.ActionNext: detail = "Skipped to the next song"
-	case protocol.ActionPrevious: detail = "Went back to the previous song"
-	case protocol.ActionPlay: detail = "Started playback"
-	case protocol.ActionPause: detail = "Paused playback"
-	case protocol.ActionSeek: detail = "Changed the playback position"
-	case protocol.ActionKick: detail = "Removed a listener from the party"
-	case protocol.ActionSetMaxMembers: detail = "Changed the party size"
-	case protocol.ActionSetAutoplay: detail = "Changed AutoPlay"
+		if tracks, ok := frame["queue"].([]interface{}); ok {
+			detail = fmt.Sprintf("Replaced the queue with %d tracks", len(tracks))
+		}
+	case protocol.ActionQueueRemove:
+		detail = "Removed a track from the queue"
+	case protocol.ActionQueueClear:
+		detail = "Cleared upcoming tracks"
+	case protocol.ActionQueueMove:
+		detail = "Reordered the upcoming queue"
+	case protocol.ActionNext:
+		detail = "Skipped to the next song"
+	case protocol.ActionPrevious:
+		detail = "Went back to the previous song"
+	case protocol.ActionPlay:
+		detail = "Started playback"
+	case protocol.ActionPause:
+		detail = "Paused playback"
+	case protocol.ActionSeek:
+		detail = "Changed the playback position"
+	case protocol.ActionKick:
+		detail = "Removed a listener from the party"
+	case protocol.ActionSetMaxMembers:
+		detail = "Changed the party size"
+	case protocol.ActionSetAutoplay:
+		detail = "Changed AutoPlay"
 	}
 	return map[string]interface{}{"type": protocol.FrameActivity, "action": action, "by": member.DisplayName, "detail": detail, "atMs": clock.NowMs()}
 }
